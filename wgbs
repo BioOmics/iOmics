@@ -1,0 +1,762 @@
+# !/bin/bash
+# Author: Haoyu Chao
+# Date: 2023-03-30
+# Email: haoyuchao@zju.edu.cn
+# Description: BS-Seq (WGBS) data analysis pipeline
+# Dependences: sra-tools, fastp, bwa-mem2, bwameth, sambamba, MethylDackel
+# ==================================================
+usage() {
+cat << EOF
+Usage:
+  $(basename $0) [options] -i input -g genome -a annotation
+
+Output:
+  The output will be named as the input file name with "_$(basename $0)_result" suffix.
+
+Example:
+  For SRA data:
+  $(basename $0) -i SRRID.sra -g genome.fa -a annotation.gff3
+  For fastq SE data:
+  $(basename $0) -i fileName.fq.gz -g genome.fa -a annotation.gff3
+  For fastq PE data:
+  $(basename $0) -i fileName_1.fq.gz -I fileName_2.fastq.gz -g genome.fa -a annotation.gff3
+  For BAM data:
+  $(basename $0) -i fileName.bam -g genome.fa -a annotation.gff3
+  For SAM data:
+  $(basename $0) -i fileName.sam -g genome.fa -a annotation.gff3
+
+Options:
+Required parameters:
+  -i, --input        input file 1 (SRA, fastq, BAM or SAM)
+  -I, --input2       input file 2 (fastq), only required in paired-end (PE) mode
+  -g, --genome       reference genome (fasta)
+  -a, --annotation   annotation file (gff3 or gtf)
+
+Optional parameters:
+  -q, --mapq         minimum mapping quality for alignment bam file (default: 10)
+  -o, --output       output directory (default: same directory as input 
+                     file with "_$(basename $0)_result" suffix)
+  -t, --threads      number of threads (default: 8)
+  -f, --force        force to overwrite the output directory
+  -r, --remove       remove the intermediate files expect raw and finnal 
+                     bam file (default: keep all intermediate files)
+  -h, --help         show help information
+  -v, --version      show version information
+EOF
+}
+
+# Print help information when no arguments passed or '-h' or '--help' option is used
+# --------------------"-h"--------------------------
+if [[ $# -eq 0 ]] || [[ $1 == "-h" ]] || [[ $1 == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+# ================get parameters==================
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    -i|--input) input="$2"; shift 2 ;;
+    -I|--input2) input2="$2"; shift 2 ;;
+    -o|--output) output="$2"; shift 2 ;;
+    -g|--genome) genome="$2"; shift 2 ;;
+    -a|--annotation) annotation="$2"; shift 2 ;;
+    -q|--mapq) mapq="$2"; shift 2 ;;
+    -t|--threads) threads="$2"; shift 2 ;;
+    -f|--force) force=1; shift 1 ;;
+    -r|--remove) remove=1; shift 1 ;;
+    -v|-V|--version) echo -e "Version: 1.0"; exit 0 ;;
+    *) echo -e "\033[1;31mError\033[0m: $1 is not a valid option";echo -e "\033[1;32mHow to solve?\033[0m Please remove $1 option"; exit 1 ;;
+  esac
+done
+# ==================================================
+
+# ================check parameters==================
+# --------------------"-q"--------------------------
+# if not use -q, then use 10
+if [[ -z "$mapq" ]]; then
+    mapq=10
+elif [[ $mapq -lt 0 || $mapq -gt 60 ]]; then
+    echo -e "\033[1;31mError\033[0m: the value of -q must be in the range of 0-60"
+    echo -e "\033[1;32mHow to solve?\033[0m Please use \"-q\" option to specify the minimum mapping quality, such as \"-q 30\""
+    exit 1
+fi
+
+# --------------------"-r"--------------------------
+# if not use -r, then use 0
+if [[ -z "$remove" ]]; then
+    remove=0
+fi
+
+
+# --------------------"-t"--------------------------
+# if not use -t, then use 4 threads
+if [[ -z "$threads" ]]; then
+    threads=8
+fi
+# --------------------"-i"--------------------------
+# check input file whether exist
+if [[ -z "$input" ]]; then
+    echo -e "\033[1;31mError\033[0m: -i is required"
+    echo -e "\033[1;32mHow to solve?\033[0m Please specify the input file by \"-i\" option"
+    exit 1
+else 
+    if [[ ! -f $input ]]; then
+        echo -e "\033[1;31mError\033[0m: $input is not exist"
+        echo -e "\033[1;32mHow to solve?\033[0m Please specify the path of input file by \"-i\" option"
+        exit 1
+    fi
+fi
+# --------------------"-I"--------------------------
+# check input file 2 whether exist
+if [ ! -z "$input2" ]; then
+    if [ ! -f $input2 ]; then
+        echo -e "\033[1;31mError\033[0m: $input2 is not exist"
+        echo -e "\033[1;32mHow to solve?\033[0m Please specify the path of input file 2 by \"-I\" option"
+        exit 1
+    fi
+fi
+# --------------------"-g"--------------------------
+if [ -z "$genome" ]; then
+    echo -e "\033[1;31mError\033[0m: -g is required"
+    exit 1
+else
+    # check genome file whether exist
+    if [ ! -f $genome ]; then
+        echo -e "\033[1;31mError\033[0m: $genome is not exist"
+        echo -e "\033[1;32mHow to solve?\033[0m Please use \"-g\" option to specify the genome path"
+        exit 1
+    else
+        # check the directory whether have permission to write
+        if [[ ! -w $(dirname $genome) ]]; then
+            echo -e "\033[1;31mError\033[0m: you don't have the permission to write in $(dirname $genome)"
+            echo -e "\033[1;33mWhy error?\033[0m Because the genome index file will be generated in the same directory as the genome file"
+            echo -e "\033[1;32mHow to solve?\033[0m Please copy genome file to your personal directory and use \"-g\" option to specify the new genome file"
+            exit 1
+        fi
+    fi
+fi
+# --------------------"-a"--------------------------
+if [ -z "$annotation" ]; then
+    echo -e "\033[1;31mError\033[0m: -a is required"
+    exit 1
+else
+    # check annotation file whether exist
+    if [ ! -f $annotation ]; then
+        echo -e "\033[1;31mError\033[0m: $annotation is not exist"
+        echo -e "\033[1;32mHow to solve?\033[0m Please use \"-a\" option to specify the annotation file with correct path"
+        exit 1
+    else
+        # check the directory whether have permission to write
+        if [[ ! -w $(dirname $annotation) ]]; then
+            echo -e "\033[1;31mError\033[0m: you don't have the permission to write in $(dirname $annotation)"
+            echo -e "\033[1;33mWhy error?\033[0m Because other annotation files (such as bed/txt file) will be generated in the same directory as the annotation file"
+            echo -e "\033[1;32mHow to solve?\033[0m Please copy annotation file to your personal directory and use \"-a\" option to specify the new annotation file"
+            exit 1
+        fi
+    fi
+fi
+
+# --------------------"-o"--------------------------
+# if use -o, check whether the directory is exist and whether have same name file
+if [[ ! -d $output && ! -f $output ]]; then
+    mkdir $output
+else
+    if [[ $force ]]; then
+        echo -e "\033[1;34mNote\033[0m: $output is exist, you used \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
+        rm -rf $output
+        mkdir $output
+    elif [[ $skip ]]; then
+        echo -e "\033[1;33mWarning\033[0m: $output is exist, you used \"-s\" option to skip the step of have been done"
+    else
+        echo -e "\033[1;31mError\033[0m: output directory \"$output\" is exist"
+        echo -e "\033[1;32mHow to solve?\033[0m Please change the output directory name by \"-o\" option or use \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
+        exit 1
+    fi
+fi
+
+# if not use -o, then output to directory same as input
+if [ -z "$output" ]; then
+    output=${input}"_"$(basename $0)_"result"
+    # check whether have the permission to write in the directory
+    if [[ ! -w $(dirname $output) ]]; then
+        echo -e "\033[1;31mError\033[0m: you don't have the permission to write in $(dirname $output)"
+        echo -e "\033[1;33mWhy error?\033[0m Because the output file will be generated a $output in the same directory as the input file by default"
+        echo -e "\033[1;32mHow to solve?\033[0m Please specify the output directory to your personal directory by \"-o\" option"
+        exit 1
+    else
+        # if use -o, check whether the directory is exist and whether have same name file
+        if [[ ! -d $output && ! -f $output ]]; then
+            mkdir $output
+        else
+            if [[ $force ]]; then
+                echo -e "\033[1;34mNote\033[0m: $output folder is exist, you used \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
+                rm -rf $output
+                mkdir $output
+            elif [[ $skip ]]; then
+                echo -e "\033[1;34mNote\033[0m: $output folder is exist, you used \"-s\" option to skip the step of have been done"
+            else
+                echo -e "\033[1;31mError\033[0m: output directory \"$output\" is exist"
+                echo -e "\033[1;32mHow to solve?\033[0m Please change the output directory name by \"-o\" option or use \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# ==================================================
+
+
+# ====================software check================
+function CheckSoftware(){
+    if command -v $1 >/dev/null 2>&1; then
+        echo -e "\033[1;34mCheck OK: \033[1;32m${1%%.*}\033[0m"
+        sleep 1
+    else
+        echo -e "\033[1;31mError\033[0m: \033[1;32m${1%%.*}\033[0m can not be found in your PATH environment variable."
+        echo -e "\033[1;34mHow to solve?\033[0m Please install \033[1;32m${1%%.*}\033[0m by conda (e.g. \033[1;32mconda install -c bioconda ${1%%.*} -y\033[0m) or other ways and add it to the PATH environment variable."
+        echo -e "Required software: \033[1;32msra-tools, fastp, bwa-mem2, bwameth, sambamba, MethylDackel\033[0m"
+        exit 1
+    fi
+}
+
+# ================check input file==================
+# if input only one file, then use fellow mode
+if [ -z "$input2" ]; then
+    # use sra mode only when the suffix of the file name is sra or SRA
+    if [[ $input == *.sra ]] || [[ $input == *.SRA ]]; then
+
+        # ====================================================================================================
+        # ======================================== Start of SRA mode =========================================
+        # ====================================================================================================
+
+        # -------------------------- Step1 check software --------------------------
+        # Check whether the software is installed for BS-Seq (WGBS) data analysis
+        echo -e "\033[1;32mStep1:\033[0m Check whether the software is installed for BS-Seq (WGBS) data analysis"
+        
+        if command -v fasterq-dump >/dev/null 2>&1; then
+            echo -e "\033[1;34mCheck OK: \033[1;32msra-tools\033[0m"
+        else
+            echo -e "\033[1;31mError\033[0m: \033[1;32msra-tools\033[0m can not be found in your PATH environment variable."
+            echo -e "\033[1;34mHow to solve?\033[0m Please install \033[1;32msra-tools\033[0m by conda (e.g. \033[1;32mconda install -c bioconda sra-tools -y\033[0m) or other ways and add it to the PATH environment variable."
+            echo -e "Required software: \033[1;32msra-tools, fastp, bwa-mem2, bwameth, sambamba, MethylDackel\033[0m"
+            exit 1
+        fi
+        CheckSoftware "fastp"
+        CheckSoftware "bwa-mem2"
+        CheckSoftware "bwameth.py"
+        CheckSoftware "sambamba"
+        CheckSoftware "MethylDackel"
+
+        # -------------------------- Step2 split SRA file --------------------------
+        echo -e "\033[1;32mStep2:\033[0m Split SRA file"
+        input=$(realpath ${input})
+        fasterq-dump -p --include-technical -S -e ${threads} -O ${output} ${input}
+
+        # check whether the SRA file is paired-end or single-end
+        tempInput=$(basename ${input})
+        if [[ -f "${output}/${tempInput%%.*}_2.fastq" ]];then
+        # ========================== paired-end data ===============================
+            echo -e "\033[1;32mStep2:\033[0m The SRA file is paired-end"
+            # -------------------------- Step3 quality control for PE data -------------
+            echo -e "\033[1;32mStep3:\033[0m Quality control"
+            input=${tempInput%%.*}
+            fastp_threads=$((threads>=16?16:threads))
+            fastp --thread ${fastp_threads} -R "fastpc report for ${input}" \
+                -i ${output}/${input}_1.fastq -I ${output}/${input}_2.fastq \
+                -o ${output}/${input}_1.clean.fastq -O ${output}/${input}_2.clean.fastq \
+                -h ${output}/${input}.qc.html -j ${output}/${input}.qc.json
+
+            # -------------------------- Step4 build index ----------------------------
+            # check whether the index is built by bwameth.py index-mem2
+            if [[ -f "${genome}.bwameth.c2t.bwt.2bit.64" ]];then
+                echo -e "\033[1;32mStep4:\033[0m Index hes been built. Skip the step of build index"
+            else
+                echo -e "\033[1;32mStep4:\033[0m Build index, it may take a long time for the first time (next time will be skipped if we detect the index has been built)"
+                bwameth.py index-mem2 ${genome}
+            fi
+
+            # -------------------------- Step5 alignment ------------------------------
+            echo -e "\033[1;32mStep5:\033[0m Alignment"
+            bwameth.py --threads ${threads} --reference ${genome} \
+                    ${output}/${input}_1.clean.fastq ${output}/${input}_2.clean.fastq > ${output}/${input}.raw.sam
+
+            # -------------------------- Step6 sort and remove duplicates -------------
+            echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+            sambamba view -S -f bam -t ${threads} \
+                          -F "mapping_quality >= ${mapq}" \
+                          ${output}/${input}.raw.sam > ${output}/${input}.q${mapq}.bam
+            sambamba sort -t ${threads} ${output}/${input}.q${mapq}.bam -o ${output}/${input}.q${mapq}.sort.bam
+            sambamba markdup -t ${threads} -r ${output}/${input}.q${mapq}.sort.bam ${output}/${input}.q${mapq}.sort.rmdup.bam
+            sambamba index ${output}/${input}.q${mapq}.sort.rmdup.bam
+            
+            # -------------------------- Step7 methylation calling --------------------
+            echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+            #MethylDackel extract -@ ${threads} -q ${mapq} \
+            #                    --CHH --CHG -o ${output}/${tempInput%%.*} \
+            #                    ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+            
+            MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+            # ------------------------- Step8 remove the intermediate files-----------
+            if [[ ${remove} ]];then
+                echo -e "\033[1;32mStep8:\033[0m Remove the intermediate files"
+                rm ${output}/${input}_1.fastq ${output}/${input}_2.fastq \
+                   ${output}/${input}_1.clean.fastq ${output}/${input}_2.clean.fastq \
+                   ${output}/${input}.raw.sam ${output}/${input}.q${mapq}.bam \
+                   ${output}/${input}.q${mapq}.sort.bam ${output}/${input}.q${mapq}.sort.bam.bai \
+                   ${output}/${input}.q${mapq}.sort.rmdup.bam ${output}/${input}.q${mapq}.sort.rmdup.bam.bai
+            fi
+
+
+        else
+        # ========================== single-end data ===============================
+            echo -e "\033[1;32mStep2:\033[0m The SRA file is single-end"
+            # -------------------------- Step3 quality control for SE data -------------
+            echo -e "\033[1;32mStep3:\033[0m Quality control"
+            tempInput=$(basename ${input})
+            input=${tempInput%%.*}
+            fastp_threads=$((threads>=16?16:threads))
+            fastp --thread ${fastp_threads} -R "fastpc report for ${input}" \
+                -i ${output}/${input}.fastq \
+                -o ${output}/${input}.clean.fastq \
+                -h ${output}/${input}.qc.html -j ${output}/${input}.qc.json
+            
+            # -------------------------- Step4 build index ----------------------------
+            # check whether the index is built by bwameth.py index-mem2
+            if [[ -f "${genome}.bwameth.c2t.bwt.2bit.64" ]];then
+                echo -e "\033[1;32mStep4:\033[0m Index hes been built. Skip the step of build index"
+            else
+                echo -e "\033[1;32mStep4:\033[0m Build index, it may take a long time for the first time (next time will be skipped if we detect the index has been built)"
+                bwameth.py index-mem2 ${genome}
+            fi
+
+            # -------------------------- Step5 alignment ------------------------------
+            echo -e "\033[1;32mStep5:\033[0m Alignment"
+            bwameth.py --threads ${threads} --reference ${genome} \
+                    ${output}/${input}.clean.fastq > ${output}/${input}.raw.sam
+            
+            # -------------------------- Step6 sort and remove duplicates -------------
+            echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+            sambamba view -S -f bam -t ${threads} \
+                        -F "mapping_quality >= ${mapq}" \
+                            ${output}/${input}.raw.sam > ${output}/${input}.q${mapq}.bam
+            sambamba sort -t ${threads} ${output}/${input}.q${mapq}.bam -o ${output}/${input}.q${mapq}.sort.bam
+            sambamba markdup -t ${threads} -r ${output}/${input}.q${mapq}.sort.bam ${output}/${input}.q${mapq}.sort.rmdup.bam
+            sambamba index ${output}/${input}.q${mapq}.sort.rmdup.bam
+
+            # -------------------------- Step7 methylation calling --------------------
+            echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+            MethylDackel extract -@ ${threads} -q ${mapq} \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+            
+            MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+
+        fi
+        # ====================================================================================================
+        # ========================================= End of SRA mode ==========================================
+        # ====================================================================================================
+        exit 0
+    fi
+    # also use SRA model when file name has no suffix
+    tempName=$(basename $input) # due to "%%.*" will delete all content before the last ".", so we need to get the file name first, or the pathway like "../test" will be treated as "."
+    if [[ ${tempName} == ${tempName%%.*} ]]; then
+        echo -e "\033[1;33mWarning\033[0m: your file ($input) without suffix. SRA mode will be used by default."
+
+        # ====================================================================================================
+        # ========================================= Start of SRA mode ========================================
+        # ====================================================================================================
+
+        # -------------------------- Step1 check software --------------------------
+        # Check whether the software is installed for BS-Seq (WGBS) data analysis
+        echo -e "\033[1;32mStep1:\033[0m Check whether the software is installed for BS-Seq (WGBS) data analysis"
+
+        if command -v fasterq-dump >/dev/null 2>&1; then
+            echo -e "\033[1;34mCheck OK: \033[1;32msra-tools\033[0m"
+        else
+            echo -e "\033[1;31mError\033[0m: \033[1;32msra-tools\033[0m can not be found in your PATH environment variable."
+            echo -e "\033[1;34mHow to solve?\033[0m Please install \033[1;32msra-tools\033[0m by conda (e.g. \033[1;32mconda install -c bioconda sra-tools -y\033[0m) or other ways and add it to the PATH environment variable."
+            echo -e "Required software: \033[1;32msra-tools, fastp, bwa-mem2, bwameth, sambamba, MethylDackel\033[0m"
+            exit 1
+        fi
+        CheckSoftware "fastp"
+        CheckSoftware "bwa-mem2"
+        CheckSoftware "bwameth.py"
+        CheckSoftware "sambamba"
+        CheckSoftware "MethylDackel"
+
+        # -------------------------- Step2 split SRA file --------------------------
+        echo -e "\033[1;32mStep2:\033[0m Split SRA file"
+        input=$(realpath ${input})
+        fasterq-dump -p --include-technical -S -e ${threads} -O ${output} ${input}
+
+        # check whether the SRA file is paired-end or single-end
+        tempInput=$(basename ${input})
+        if [[ -f "${output}/${tempInput%%.*}_2.fastq" ]];then
+        # ========================== paired-end data ===============================
+            echo -e "\033[1;32mStep2:\033[0m The SRA file is paired-end"
+            # -------------------------- Step3 quality control for PE data -------------
+            echo -e "\033[1;32mStep3:\033[0m Quality control"
+            tempInput=$(basename ${input})
+            input=${tempInput%%.*}
+            fastp_threads=$((threads>=16?16:threads))
+            fastp --thread ${fastp_threads} -R "fastpc report for ${input}" \
+                -i ${output}/${input}_1.fastq -I ${output}/${input}_2.fastq \
+                -o ${output}/${input}_1.clean.fastq -O ${output}/${input}_2.clean.fastq \
+                -h ${output}/${input}.qc.html -j ${output}/${input}.qc.json
+
+            # -------------------------- Step4 build index ----------------------------
+            # check whether the index is built by bwameth.py index-mem2
+            if [[ -f "${genome}.bwameth.c2t.bwt.2bit.64" ]];then
+                echo -e "\033[1;32mStep4:\033[0m Index hes been built. Skip the step of build index"
+            else
+                echo -e "\033[1;32mStep4:\033[0m Build index, it may take a long time for the first time (next time will be skipped if we detect the index has been built)"
+                bwameth.py index-mem2 ${genome}
+            fi
+
+            # -------------------------- Step5 alignment ------------------------------
+            echo -e "\033[1;32mStep5:\033[0m Alignment"
+            bwameth.py --threads ${threads} --reference ${genome} \
+                    ${output}/${input}_1.clean.fastq ${output}/${input}_2.clean.fastq > ${output}/${input}.raw.sam
+
+            # -------------------------- Step6 sort and remove duplicates -------------
+            echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+            sambamba view -S -f bam -t ${threads} \
+                          -F "mapping_quality >= ${mapq}" \
+                          ${output}/${input}.raw.sam > ${output}/${input}.q${mapq}.bam
+            sambamba sort -t ${threads} ${output}/${input}.q${mapq}.bam -o ${output}/${input}.q${mapq}.sort.bam
+            sambamba markdup -t ${threads} -r ${output}/${input}.q${mapq}.sort.bam ${output}/${input}.q${mapq}.sort.rmdup.bam
+            sambamba index ${output}/${input}.q${mapq}.sort.rmdup.bam
+
+            # -------------------------- Step7 methylation calling --------------------
+            echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+            MethylDackel extract -@ ${threads} -q ${mapq} \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+            
+            MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+        else
+        # ========================== single-end data ===============================
+            echo -e "\033[1;32mStep2:\033[0m The SRA file is single-end"
+            # -------------------------- Step3 quality control for SE data -------------
+            echo -e "\033[1;32mStep3:\033[0m Quality control"
+            tempInput=$(basename ${input})
+            input=${tempInput%%.*}
+            fastp_threads=$((threads>=16?16:threads))
+            fastp --thread ${fastp_threads} -R "fastpc report for ${input}" \
+                -i ${output}/${input}.fastq \
+                -o ${output}/${input}.clean.fastq \
+                -h ${output}/${input}.qc.html -j ${output}/${input}.qc.json
+            
+            # -------------------------- Step4 build index ----------------------------
+            # check whether the index is built by bwameth.py index-mem2
+            if [[ -f "${genome}.bwameth.c2t.bwt.2bit.64" ]];then
+                echo -e "\033[1;32mStep4:\033[0m Index hes been built. Skip the step of build index"
+            else
+                echo -e "\033[1;32mStep4:\033[0m Build index, it may take a long time for the first time (next time will be skipped if we detect the index has been built)"
+                bwameth.py index-mem2 ${genome}
+            fi
+
+            # -------------------------- Step5 alignment ------------------------------
+            echo -e "\033[1;32mStep5:\033[0m Alignment"
+            bwameth.py --threads ${threads} --reference ${genome} \
+                    ${output}/${input}.clean.fastq > ${output}/${input}.raw.sam
+            
+            # -------------------------- Step6 sort and remove duplicates -------------
+            echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+            sambamba view -S -f bam -t ${threads} \
+                          -F "mapping_quality >= ${mapq}" \
+                          ${output}/${input}.raw.sam > ${output}/${input}.q${mapq}.bam
+            sambamba sort -t ${threads} ${output}/${input}.q${mapq}.bam -o ${output}/${input}.q${mapq}.sort.bam
+            sambamba markdup -t ${threads} -r ${output}/${input}.q${mapq}.sort.bam ${output}/${input}.q${mapq}.sort.rmdup.bam
+            sambamba index ${output}/${input}.q${mapq}.sort.rmdup.bam
+
+            # -------------------------- Step7 methylation calling --------------------
+            echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+            MethylDackel extract -@ ${threads} -q ${mapq} \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+            
+            MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+
+        fi
+
+        # ====================================================================================================
+        # ======================================== End of SRA mode ===========================================
+        # ====================================================================================================
+
+        exit 0
+    fi
+    # if the suffix of the file name is fastq or fastq.gz or fq.gz or fq, then use fastq mode
+    if [[ $input == *.fastq ]] || [[ $input == *.fastq.gz ]] || [[ $input == *.fq.gz ]] || [[ $input == *.fq ]]; then
+
+        # ====================================================================================================
+        # ======================================== Start of fastq SE mode ====================================
+        # ====================================================================================================
+
+        # -------------------------- Step1 check software --------------------------
+        # Check whether the software is installed for BS-Seq (WGBS) data analysis
+        echo -e "\033[1;32mStep1:\033[0m Check whether the software is installed for BS-Seq (WGBS) data analysis"
+        CheckSoftware "fastp"
+        CheckSoftware "bwa-mem2"
+        CheckSoftware "bwameth.py"
+        CheckSoftware "sambamba"
+        CheckSoftware "MethylDackel"
+
+        # -------------------------- Step2 check input -----------------------------
+        # check whether the input file is SRA file
+        echo -e "\033[1;32mStep2:\033[0m Skip split SRA file into fastq file"
+        
+        # -------------------------- Step3 quality control for SE data -------------
+        echo -e "\033[1;32mStep3:\033[0m Quality control"
+        tempInput=$(basename ${input})
+        fastp_threads=$((threads>=16?16:threads))
+        fastp --thread ${fastp_threads} -R "fastpc report for ${tempInput%%.*}" \
+            -i ${output}/${tempInput} \
+            -o ${output}/${tempInput%%.*}.clean.fastq \
+            -h ${output}/${tempInput%%.*}.qc.html -j ${output}/${tempInput%%.*}.qc.json
+        
+        # -------------------------- Step4 build index ----------------------------
+        # check whether the index is built by bwameth.py index-mem2
+        if [[ -f "${genome}.bwameth.c2t.bwt.2bit.64" ]];then
+            echo -e "\033[1;32mStep4:\033[0m Index hes been built. Skip the step of build index"
+        else
+            echo -e "\033[1;32mStep4:\033[0m Build index, it may take a long time for the first time (next time will be skipped if we detect the index has been built)"
+            bwameth.py index-mem2 ${genome}
+        fi
+
+        # -------------------------- Step5 alignment ------------------------------
+        input=${tempInput%%.*}
+        echo -e "\033[1;32mStep5:\033[0m Alignment"
+        bwameth.py --threads ${threads} --reference ${genome} \
+                ${output}/${input}.clean.fastq > ${output}/${input}.raw.sam
+        
+        # -------------------------- Step6 sort and remove duplicates -------------
+        echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+        sambamba view -S -f bam -t ${threads} \
+                      -F "mapping_quality >= ${mapq}" \
+                      ${output}/${input}.raw.sam > ${output}/${input}.q${mapq}.bam
+        sambamba sort -t ${threads} ${output}/${input}.q${mapq}.bam -o ${output}/${input}.q${mapq}.sort.bam
+        sambamba markdup -t ${threads} -r ${output}/${input}.q${mapq}.sort.bam ${output}/${input}.q${mapq}.sort.rmdup.bam
+        sambamba index ${output}/${input}.q${mapq}.sort.rmdup.bam
+
+        # -------------------------- Step7 methylation calling --------------------
+        echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+        MethylDackel extract -@ ${threads} -q ${mapq} \
+                            --CHH --CHG -o ${output}/${tempInput%%.*} \
+                            ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+        
+        MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                            --CHH --CHG -o ${output}/${tempInput%%.*} \
+                            ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+
+        # ====================================================================================================
+        # ======================================== End of fastq SE mode ======================================
+        # ====================================================================================================
+
+        exit 0
+    fi
+    # if the suffix of the file name is bam, then use bam mode
+    if [[ $input == *.bam ]]; then
+
+        # ====================================================================================================
+        # ======================================== Start of bam mode =========================================
+        # ====================================================================================================
+        # -------------------------- Step1 check software --------------------------
+        # Check whether the software is installed for BS-Seq (WGBS) data analysis
+        echo -e "\033[1;32mStep1:\033[0m Check whether the software is installed for BS-Seq (WGBS) data analysis"
+        CheckSoftware "sambamba"
+        CheckSoftware "MethylDackel"
+
+        # -------------------------- Step2 check input -----------------------------
+        echo -e "\033[1;32mStep2:\033[0m Skip split SRA file into fastq file"
+
+        # -------------------------- Step3 quality control -------------
+        echo -e "\033[1;32mStep3:\033[0m Skip quality control"
+        
+        # -------------------------- Step4 build index ----------------------------
+        echo -e "\033[1;32mStep3:\033[0m Skip build index"
+
+        # -------------------------- Step5 alignment ------------------------------
+        echo -e "\033[1;32mStep5:\033[0m Skip alignment"
+
+        # -------------------------- Step6 sort and remove duplicates -------------
+        echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+        tempInput=$(basename ${input})
+        sambamba view -f bam -t ${threads} \
+                      -F "mapping_quality >= ${mapq}" \
+                      ${input} > ${output}/${tempInput%%.*}.q${mapq}.bam
+        sambamba sort -t ${threads} ${output}/${tempInput%%.*}.q${mapq}.bam -o ${output}/${tempInput%%.*}.q${mapq}.sort.bam
+        sambamba markdup -t ${threads} -r ${output}/${tempInput%%.*}.q${mapq}.sort.bam ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+        sambamba index ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+
+        # -------------------------- Step7 methylation calling --------------------
+        echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+        MethylDackel extract -@ ${threads} -q ${mapq} \
+                            --CHH --CHG -o ${output}/${tempInput%%.*} \
+                            ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+        
+        MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                            --CHH --CHG -o ${output}/${tempInput%%.*} \
+                            ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+        # ====================================================================================================
+        # ======================================== End of bam mode ===========================================
+        # ====================================================================================================
+        exit 0
+    fi
+    # if the suffix of the file name is sam, then use sam mode
+    if [[ $input == *.sam ]]; then
+
+        # ====================================================================================================
+        # ======================================== Start of sam mode =========================================
+        # ====================================================================================================
+        # -------------------------- Step1 check software --------------------------
+        # Check whether the software is installed for BS-Seq (WGBS) data analysis
+        echo -e "\033[1;32mStep1:\033[0m Check whether the software is installed for BS-Seq (WGBS) data analysis"
+        CheckSoftware "sambamba"
+        CheckSoftware "MethylDackel"
+
+        # -------------------------- Step2 check input -----------------------------
+        # check whether the input file is SRA file
+        echo -e "\033[1;32mStep2:\033[0m Skip split SRA file into fastq file"
+        
+        # -------------------------- Step3 quality control for SE data -------------
+        echo -e "\033[1;32mStep3:\033[0m Skip quality control"
+
+        # -------------------------- Step4 build index ----------------------------
+        echo -e "\033[1;32mStep3:\033[0m Skip build index"
+
+        # -------------------------- Step5 alignment ------------------------------
+        echo -e "\033[1;32mStep5:\033[0m Skip alignment"
+
+        # -------------------------- Step6 sort and remove duplicates -------------
+        echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+        tempInput=$(basename ${input})
+        sambamba view -S -f bam -t ${threads} \
+                      -F "mapping_quality >= ${mapq}" \
+                      ${input} > ${output}/${tempInput%%.*}.q${mapq}.bam
+        sambamba sort -t ${threads} ${output}/${tempInput%%.*}.q${mapq}.bam -o ${output}/${tempInput%%.*}.q${mapq}.sort.bam
+        sambamba markdup -t ${threads} -r ${output}/${tempInput%%.*}.q${mapq}.sort.bam ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+        sambamba index ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+
+        # -------------------------- Step7 methylation calling --------------------
+        echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+        MethylDackel extract -@ ${threads} -q ${mapq} \
+                            --CHH --CHG -o ${output}/${tempInput%%.*} \
+                            ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+        
+        MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                            --CHH --CHG -o ${output}/${tempInput%%.*} \
+                            ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+
+        # ====================================================================================================
+        # ======================================== End of sam mode ==========================================
+        # ====================================================================================================
+
+        exit 0
+    fi
+    # if the suffix of the file name is not sra or fastq or fastq.gz or fq.gz or fq or bam or bam.gz or sam or sam.gz, then print \033[1;31mError\033[0m information
+    if [[ ${tempName} != ${tempName%%.*} ]] && [[ $input != *.sra ]] && [[ $input != *.SRA ]] && [[ $input != *.fastq ]] && [[ $input != *.fastq.gz ]] && [[ $input != *.fq.gz ]] && [[ $input != *.fq ]] && [[ $input != *.bam ]] && [[ $input != *.bam.gz ]] && [[ $input != *.sam ]] && [[ $input != *.sam.gz ]]; then
+        echo -e "\033[1;31mError\033[0m: we can't recognize your input file."
+        echo -e "\033[1;33mWhy error?\033[0m Because the suffix (${tempName##*.}) of your input file is not supported."
+        echo -e "\033[1;32mHow to solve?\033[0m Please check your input file type."
+        echo -e "\033[1;34mNote:\033[0m only SRA(.sra), Fastq(.fq/.fq.gz), BAM(.bam) or SAM(.sam) are supported as input."
+        exit 1
+    fi
+# if input two files, then use paired end mode and if the suffix must be fastq or fastq.gz or fq.gz or fq
+else
+    if [[ $input == *.fastq && $input2 == *.fastq ]] || [[ $input == *.fastq.gz && $input2 == *.fastq.gz ]] || [[ $input == *.fq.gz && $input2 == *.fq.gz ]] || [[ $input == *.fq && $input2 == *.fq ]]; then
+        # if input is same as input2 then print \033[1;31mError\033[0m information
+        if [ $input == $input2 ]; then
+            echo -e "\033[1;31mError\033[0m: -i and -I input file must be different."
+            exit 1
+        else
+
+            # ====================================================================================================
+            # ======================================== Start of PE mode ==========================================
+            # ====================================================================================================
+            # -------------------------- Step1 check software --------------------------
+            # Check whether the software is installed for BS-Seq (WGBS) data analysis
+            echo -e "\033[1;32mStep1:\033[0m Check whether the software is installed for BS-Seq (WGBS) data analysis"
+            CheckSoftware "fastp"
+            CheckSoftware "bwa-mem2"
+            CheckSoftware "bwameth.py"
+            CheckSoftware "sambamba"
+            CheckSoftware "MethylDackel"
+
+            # -------------------------- Step2 split fastq -----------------------------
+            echo -e "\033[1;32mStep2:\033[0m Skip split SRA file into fastq file"
+
+            # -------------------------- Step3 quality control for PE data -------------
+            echo -e "\033[1;32mStep3:\033[0m Quality control"
+            tempInput=$(basename ${input})
+            tempInput2=$(basename ${input2})
+
+            fastp_threads=$((threads>=16?16:threads))
+            fastp --thread ${fastp_threads} -R "fastpc report for ${input}" \
+                -i ${input} -I ${input2} \
+                -o ${output}/${tempInput%%.*}_1.clean.fastq -O ${output}/${tempInput2%%.*}_2.clean.fastq \
+                -h ${output}/${tempInput%%.*}.qc.html -j ${output}/${tempInput%%.*}.qc.json
+
+            # -------------------------- Step4 build index ----------------------------
+            # check whether the index is built by bwameth.py index-mem2
+            if [[ -f "${genome}.bwameth.c2t.bwt.2bit.64" ]];then
+                echo -e "\033[1;32mStep4:\033[0m Index hes been built. Skip the step of build index"
+            else
+                echo -e "\033[1;32mStep4:\033[0m Build index, it may take a long time for the first time (next time will be skipped if we detect the index has been built)"
+                bwameth.py index-mem2 ${genome}
+            fi
+
+            # -------------------------- Step5 alignment ------------------------------
+            echo -e "\033[1;32mStep5:\033[0m Alignment"
+            bwameth.py --threads ${threads} --reference ${genome} \
+                    ${output}/${tempInput%%.*}_1.clean.fastq ${output}/${tempInput2%%.*}_2.clean.fastq > ${output}/${tempInput%%.*}.raw.sam
+
+            # -------------------------- Step6 sort and remove duplicates -------------
+            echo -e "\033[1;32mStep6:\033[0m Sort and remove duplicates"
+            sambamba view -S -f bam -t ${threads} \
+                          -F "mapping_quality >= ${mapq}" \
+                          ${output}/${tempInput%%.*}.raw.sam > ${output}/${tempInput%%.*}.q${mapq}.bam
+            sambamba sort -t ${threads} ${output}/${tempInput%%.*}.q${mapq}.bam -o ${output}/${tempInput%%.*}.q${mapq}.sort.bam
+            sambamba markdup -t ${threads} -r ${output}/${tempInput%%.*}.q${mapq}.sort.bam ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+            sambamba index ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+            
+            # -------------------------- Step7 methylation calling --------------------
+            echo -e "\033[1;32mStep7:\033[0m Methylation calling"
+            MethylDackel extract -@ ${threads} -q ${mapq} \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+            
+            MethylDackel extract -@ ${threads} -q ${mapq} --cytosine_report \
+                                --CHH --CHG -o ${output}/${tempInput%%.*} \
+                                ${genome} ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam 
+            
+            # remove intermediate files
+            if [[ remove == 1 ]];then
+                rm -f ${output}/${tempInput%%.*}_1.clean.fastq
+                rm -f ${output}/${tempInput2%%.*}_2.clean.fastq
+                # rm -f ${output}/${tempInput%%.*}.raw.sam
+                rm -f ${output}/${tempInput%%.*}.q${mapq}.bam
+                rm -f ${output}/${tempInput%%.*}.q${mapq}.sort.bam
+                rm -f ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam
+                rm -f ${output}/${tempInput%%.*}.q${mapq}.sort.rmdup.bam.bai
+            fi
+
+            # ====================================================================================================
+            # ======================================== End of PE mode ============================================
+            # ====================================================================================================
+            exit 0
+        fi 
+    else
+        echo -e "\033[1;31mError\033[0m: -i and -I must have same file type (.fastq/.fastq.gz/fq.gz/fq)"
+        exit 1
+    fi
+fi
+# ==================================================
