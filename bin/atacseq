@@ -1,9 +1,9 @@
 # !/bin/bash
-# Author: Haoyu Chao
-# Last modified: 2024-03-26
+# Author: BioOmics
+# Last modified: 2024-11-01
 # Email: haoyuchao@zju.edu.cn
-# Description: Bulk RNA-Seq quantification pipeline
-# Dependences: sra-tools, fastp, STAR, sambamba, rsem, deeptools
+# Description: Bulk ATAC-Seq analysis pipeline
+# Dependences: sra-tools, fastp, bwa, sambamba, samtools, deeptools, 
 # ==================================================
 # software check ($1 is the software name, $2 is the software name need to install)
 function CheckSoftware(){
@@ -19,26 +19,29 @@ function CheckSoftware(){
 }
 CheckSoftware "fasterq-dump" "sra-tools"
 CheckSoftware "fastp" "fastp"
-CheckSoftware "STAR" "STAR"
-CheckSoftware "rsem-prepare-reference" "rsem"
+CheckSoftware "bwa" "bwa"
+CheckSoftware "samtools" "samtools"
 CheckSoftware "sambamba" "sambamba"
-CheckSoftware "deeptools" "deeptools"
+CheckSoftware "macs3" "macs3"
+CheckSoftware "bamCoverage" "deeptools"
 # ==================================================
 
 usage() {
 cat << EOF
 Description:
-  Process RNA-Seq data, including quality control, 
-  alignment, quantification and bigwig file generation. 
+  Process bulk ATAC-Seq data, including quality control, alignment, peak calling, and bigwig file generation
 
 Usage:
   $(basename $0) -i input -g genome -a annotation [options]
 
 Output:
   The output will be named as the input file name with "_$(basename $0)_result" suffix, including:
-    1. fastp report
-    2. alignment bam file
-    3. quantification result
+    1. fastq files: clean fastq files after quality control
+    2. bam files: alignment results
+    3. bed files: peak calling results
+    4. bigwig files: bigwig files for visualization
+    5. report files: statics of the analysis
+
     
 Options:
 Required parameters:
@@ -51,8 +54,7 @@ Optional parameters:
   -q, --qualityBase  minimum quality value of average base quality (default: 20)
   -b, --binSize      generate bigwig file (default: no). Once use this option, 
                      you must set bin size by this option, such as "-b 10"
-  -o, --output       output directory (default: same directory as input 
-                     file with "_$(basename $0)_result" suffix)
+  -o, --output       Specify output directory (default: current directory with "_$(basename $0)_result" suffix)
   -t, --threads      number of threads (default: 8)
   -f, --force        force to overwrite the output directory
   -s, --skip         skip the step of have been done (default: no)
@@ -172,6 +174,7 @@ else
         exit 1
     fi
 fi
+input=$(realpath $input)
 
 # --------------------"-I"--------------------------
 # check input file 2 whether exist
@@ -182,6 +185,7 @@ if [ ! -z "$input2" ]; then
         exit 1
     fi
 fi
+input2=$(realpath $input2)
 
 # --------------------"-g"--------------------------
 if [ -z "$genome" ]; then
@@ -203,6 +207,7 @@ else
         fi
     fi
 fi
+genome=$(realpath $genome)
 
 # --------------------"-a"--------------------------
 if [ -z "$annotation" ]; then
@@ -223,9 +228,9 @@ else
             exit 1
         else
             # check the format of the annotation file
-            if [[ $annotation != *.gff3 ]] && [[ $annotation != *.gtf ]]&& [[ $annotation != *.gff ]]; then
+            if [[ $annotation != *.gff3 ]] && [[ $annotation != *.gff ]] && [[ $annotation != *.gtf ]]; then
                 echo -e "\033[1;31mError\033[0m: the format of $annotation is not supported"
-                echo -e "\033[1;32mHow to solve?\033[0m Please use \"-a\" option to specify the annotation file with gff3/gtf/gff suffix"
+                echo -e "\033[1;32mHow to solve?\033[0m Please use \"-a\" option to specify the annotation file with gff/gff3/gtf suffix"
                 exit 1
             # check the content of the annotation file whether have nine columns
             else
@@ -238,6 +243,7 @@ else
         fi
     fi
 fi
+annotation=$(realpath $annotation)
 
 # --------------------"-o"--------------------------
 # if use -o, check whether the directory is exist and whether have same name file
@@ -259,32 +265,25 @@ fi
 
 # if not use -o, then output to directory same as input
 if [ -z "$output" ]; then
-    output=${input}"_"$(basename $0)_"result"
-    # check whether have the permission to write in the directory
-    if [[ ! -w $(dirname $output) ]]; then
-        echo -e "\033[1;31mError\033[0m: you don't have the permission to write in $(dirname $output)"
-        echo -e "\033[1;33mWhy error?\033[0m Because the output file will be generated a $output in the same directory as the input file by default"
-        echo -e "\033[1;32mHow to solve?\033[0m Please specify the output directory to your personal directory by \"-o\" option"
-        exit 1
+    # get the file name without suffix
+    output=$(basename "$input" | sed 's/[@:._-].*//')"_"$(basename $0)_"result"
+    if [[ ! -d $output && ! -f $output ]]; then
+        mkdir $output
     else
-        # if use -o, check whether the directory is exist and whether have same name file
-        if [[ ! -d $output && ! -f $output ]]; then
+        if [[ $force ]]; then
+            echo -e "\033[1;34mNote\033[0m: $output folder is exist, you used \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
+            rm -rf $output
             mkdir $output
+        elif [[ $skip ]]; then
+            echo -e "\033[1;34mNote\033[0m: $output folder is exist, you used \"-s\" option to skip the step of have been done"
         else
-            if [[ $force ]]; then
-                echo -e "\033[1;34mNote\033[0m: $output folder is exist, you used \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
-                rm -rf $output
-                mkdir $output
-            elif [[ $skip ]]; then
-                echo -e "\033[1;34mNote\033[0m: $output folder is exist, you used \"-s\" option to skip the step of have been done"
-            else
-                echo -e "\033[1;31mError\033[0m: output directory \"$output\" is exist"
-                echo -e "\033[1;32mHow to solve?\033[0m Please change the output directory name by \"-o\" option or use \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
-                exit 1
-            fi
+            echo -e "\033[1;31mError\033[0m: output directory \"$output\" is exist"
+            echo -e "\033[1;32mHow to solve?\033[0m Please change the output directory name by \"-o\" option or use \"-f\" option to force overwrite the output directory or use \"-s\" option to skip the step of have been done"
+            exit 1
         fi
     fi
 fi
+cd $output
 
 # ==================================================
 # ==================function========================
@@ -323,11 +322,10 @@ function AfterCheck(){
 # fasterq-dump
 function FasterqDump(){
     local input=$(realpath $1)
-    local output=$(realpath $2)
-    BeforeCheck $output/*fastq
+    BeforeCheck ./*fastq
     if [[ $? -eq 0 ]]; then
-        fasterq-dump -p --include-technical -S -e ${threads} -O ${output} ${input}
-        AfterCheck ${output}/*fastq
+        fasterq-dump -p --include-technical -S -e ${threads} -O ./ ${input}
+        AfterCheck ./*fastq
     fi
 }
 
@@ -344,13 +342,13 @@ function Fastp(){
     if [[ $? -eq 0 ]]; then
         if [[ ${mode} == "SE" ]]; then
             fastp --thread ${fastpThreads} -q $qualityBase \
-                -R "fastpc report for ${output}" \
+                -R "QC report for ${output}" \
                 -i ${input1} -o ${output1} \
                 -h ${output}.qc.html -j ${output}.qc.json
         else
             fastp --thread ${fastpThreads} -q $qualityBase \
                 --detect_adapter_for_pe \
-                -R "fastpc report for ${output}" \
+                -R "QC report for ${output}" \
                 -i ${input1} -I ${input2} \
                 -o ${output1} -O ${output2} \
                 -h ${output}.qc.html -j ${output}.qc.json
@@ -365,180 +363,102 @@ function Fastp(){
     reads_duplication_rate=$(grep -Pzo '"duplication":\s*{\s*[^{}]*\s*}' ${output}.qc.json | grep -Poa '"rate":\s*\K\d+\.\d+' | awk '{printf "%.2f\n", $NF*100}')
 }
 
-# GTF check
-function DeleteOverlapExon(){
-    local annotation=$1
-    sort -t $'\t' -k9,9 -k1,1V -k4,4n ${annotation} | \
-    awk -vFS="\t" -vOFS="\t" '{
-        if ($3 == "exon") {
-            split($9, a, /";"/); split(a[1], b, / /);
-            transcript_id = substr(b[2], 2);
-            if (NR == 1) {
-                prev_line = $0; prev_start = $4; prev_end = $5;
-                prev_transcript_id = transcript_id;
-            } else {
-                if (transcript_id == prev_transcript_id) {
-                    if ($4 <= prev_end && $5 >= prev_start) {
-                        if (($5 - $4) >= (prev_end - prev_start)) {
-                            prev_start = $4; prev_end = $5;
-                        }
-                    } else {
-                        print prev_line; prev_line = $0;
-                        prev_start = $4; prev_end = $5;
-                    }
-                } else {
-                    print prev_line; prev_line = $0;
-                    prev_start = $4; prev_end = $5;
-                    prev_transcript_id = transcript_id;
-                }
-            }
-        }
-    } END {if (prev_line != "") {print prev_line}}' > ${annotation}.tmp
-    mv ${annotation}.tmp ${annotation}
-    sed -i '/^$/d' ${annotation}
-}
-
-# RSEM index
-function RSEMIndex(){
-    local annotation=$1
-    local genome=$2
-    local annotationIndex=$(dirname $(realpath ${annotation}))/RSEMIndex
-    if [[ -f "${annotationIndex}/RSEMIndex.n2g.idx.fa" ]];then
-        echo -e "\033[1;34mNote:\033[0m Index hes been built. Skip the step of build index. If you want to rebuild the index, please remove the index file (rm -rf ${annotationIndex}) and run the script again"
-    else
-        rm -rf ${annotationIndex}
-        mkdir ${annotationIndex}
-        echo -e "\033[1;34mNote:\033[0m Build RSEM index, it may take some time for the first time (next time will be skipped)"
-        sed '/^$/d' ${annotation} > ${annotationIndex}/$(basename ${annotation}) # remove empty lines, or it will cause error in rsem-prepare-reference
-        local annotation=${annotationIndex}/$(basename ${annotation})
-        if [[ $annotation == *.gff3 ]] || [[ $annotation == *.gff ]]; then
-            rsem-gff3-to-gtf ${annotation} ${annotationIndex}/$(basename ${annotation} .gff3).gtf
-            DeleteOverlapExon ${annotationIndex}/$(basename ${annotation} .gff3).gtf
-            rsem-prepare-reference --gtf ${annotationIndex}/$(basename ${annotation} .gff3).gtf ${genome} ${annotationIndex}/RSEMIndex
-            cp ${annotationIndex}/$(basename ${annotation} .gff3).gtf ${annotationIndex}/RSEMIndex.gtf # it will be used in the STAR index step
-        else
-            DeleteOverlapExon ${annotation}
-            rsem-prepare-reference --gtf ${annotation} ${genome} ${annotationIndex}/RSEMIndex
-            cp ${annotation} ${annotationIndex}/RSEMIndex.gtf # it will be used in the STAR index step
-        fi
-        AfterCheck ${annotationIndex}/RSEMIndex.n2g.idx.fa
-    fi
-}
-
-# STAR index
-function STARIndex(){
+# bwa index
+function BWAIndex(){
     local genome=$1
-    local annotation=$2
-    local annotationIndex=$(dirname $(realpath ${annotation}))/RSEMIndex
-    local alignmentIndex=$(dirname $(realpath ${genome}))/STARIndex
-    local genomeSAindexNbases=$(awk '{i+=$2} END {if(log(i)/log(2)/2-1>=14){print 14}else{print int(log(i)/log(2)/2-1)}}' $annotationIndex/RSEMIndex.chrlist)
-    if [[ -f "${alignmentIndex}/SA" ]];then
-        echo -e "\033[1;34mNote:\033[0m Index hes been built. Skip the step of build index. If you want to rebuild the index, please remove the index file (rm -rf ${alignmentIndex}) and run the script again"
-    else
-        echo -e "\033[1;34mNote:\033[0m It may take a long time for the first time (next time will be skipped)"
-        mkdir ${alignmentIndex}
-        STAR --runThreadN ${threads} \
-        --runMode genomeGenerate \
-        --genomeDir ${alignmentIndex} \
-        --genomeSAindexNbases ${genomeSAindexNbases} \
-        --genomeFastaFiles ${genome} --sjdbGTFfile ${annotationIndex}/RSEMIndex.gtf --sjdbOverhang 100
-        AfterCheck ${alignmentIndex}/SA
+    local genomeIndex=$(dirname $(realpath ${genome}))/BWAIndex
+    BeforeCheck ${genomeIndex}/BWAIndex.bwt
+    if [[ $? -eq 0 ]]; then
+        rm -rf ${genomeIndex}
+        mkdir ${genomeIndex}
+        echo -e "\033[1;34mNote:\033[0m Build RSEM index, it may take some time for the first time (next time will be skipped)"
+        bwa index -p ${genomeIndex}/BWAIndex ${genome}
+        AfterCheck ${genomeIndex}/BWAIndex.bwt
     fi
 }
 
-function calculateMaxThreadsforSTAR() {
-    local threads=$1
-    local maxThreads
-    if [[ $threads -gt 16 ]]; then # choose 16, as then more than 16, STAR sort will add addtional files (16x3=48, is <50)
-        tempThreads=$(ulimit -n | awk '{printf "%.0f", sqrt($1/3)-1}')
-        if [[ $threads -gt $tempThreads ]]; then
-            maxThreads=${tempThreads}
-            echo -e "\033[1;33mWarning\033[0m: Your threads ($threads) is too large for STAR alignment ($maxThreads used). Because your system set \"ulimit -n\" to $(ulimit -n), which only allow use $maxThreads threads for STAR alignment. If you want to use more threads, please set ulimit -n to a larger value." >&2
-        else
-            maxThreads=${threads}
-        fi
-    else
-        tempThreads=$(ulimit -n | awk '{printf "%.0f", $1/50-1}')
-        if [[ $threads -gt $tempThreads ]]; then
-            maxThreads=${tempThreads}
-            echo -e "\033[1;33mWarning\033[0m: Your threads ($threads) is too large for STAR alignment ($maxThreads used). Because your system set \"ulimit -n\" to $(ulimit -n), which only allow use $maxThreads threads for STAR alignment. If you want to use more threads, please set ulimit -n to a larger value." >&2
-        else
-            maxThreads=${threads}
-        fi
-    fi
-    echo "$maxThreads"
-}
-
-# STAR alignment
-function STARAlignment(){
+# bwa alignment
+function BWAAlignment(){
     local mode=$1
-    local fq=$2
+    local output=$2
     local alignmentIndex=$3
     local fq1=$4
     local fq2=$5
-    local maxThreads=$(calculateMaxThreadsforSTAR $threads)
-    BeforeCheck ${fq}.Aligned.sortedByCoord.out.bam
+    BeforeCheck ./${output}.raw.bam
     if [[ $? -eq 0 ]]; then
         if [[ ${mode} == "SE" ]]; then
-            STAR --runThreadN ${maxThreads} \
-            --genomeDir ${alignmentIndex} \
-            --readFilesIn <(zcat ${fq1} || cat ${fq1} ) \
-            --outFileNamePrefix ${fq}. \
-            --outSAMtype BAM SortedByCoordinate \
-            --outBAMsortingThreadN ${maxThreads} \
-            --quantMode TranscriptomeSAM
+            bwa mem -M -t ${threads} -v 1 \
+            -R "@RG\tID:${output}\tSM:${output}\tLB:ATAC\tPL:Illumina" \
+            ${alignmentIndex} \
+            ${fq1} | samtools view -@ ${threads} -bh > ./${output}.raw.bam
         else
-            STAR --runThreadN ${maxThreads} \
-            --genomeDir ${alignmentIndex} \
-            --readFilesIn <(zcat ${fq1} || cat ${fq1}) <(zcat ${fq2} || cat ${fq2}) \
-            --outFileNamePrefix ${fq}. \
-            --outSAMtype BAM SortedByCoordinate \
-            --outBAMsortingThreadN ${maxThreads} \
-            --quantMode TranscriptomeSAM
+            bwa mem -M -t ${threads} -v 1 \
+            -R "@RG\tID:${output}\tSM:${output}\tLB:ATAC\tPL:Illumina" \
+            ${alignmentIndex} \
+            ${fq1} ${fq2} | samtools view -@ ${threads} -bh > ./${output}.raw.bam
         fi
-        AfterCheck ${fq}.Aligned.sortedByCoord.out.bam
+        AfterCheck ./${output}.raw.bam
     fi
 
+    alignment_rate=$(sambamba flagstat -t ${threads} ./${output}.raw.bam |head -5|tail -1|cut -d "(" -f2|cut -d ":" -f1)
 
-    total_reads_unique_mapped=$(grep "Uniquely mapped reads number" ${fq}.Log.final.out | awk '{print $NF}')
-    total_reads_multiple_mapped=$(grep "Number of reads mapped to multiple loci" ${fq}.Log.final.out | awk '{print $NF}')
-    unique_mapped_rate=$(grep "Uniquely mapped reads %" ${fq}.Log.final.out | sed 's/%//g' | awk '{printf "%.2f\n", $NF}')
-
-    BeforeCheck ${fq}.Aligned.sortedByCoord.out.bam.bai
+    BeforeCheck ./${output}.raw.bam.bai
     if [[ $? -eq 0 ]]; then
-        sambamba index -t $threads ${fq}.Aligned.sortedByCoord.out.bam
-        AfterCheck ${fq}.Aligned.sortedByCoord.out.bam.bai
+        sambamba index -t $threads ./${output}.raw.bam
+        AfterCheck ./${output}.raw.bam.bai
     fi
 }
 
-# RSEM quantification
-function RSEMQuantification(){
-    local mode=$1
-    local input=$2
-    local annotationIndex=$3
-    local output=$4
-    BeforeCheck ${output}.genes.results
+# Remove duplicates
+function RemoveDuplicates(){
+    local input=$1
+    local output=$2
+    BeforeCheck ${output}.bam
     if [[ $? -eq 0 ]]; then
-        if [[ ${mode} == "SE" ]]; then
-            rsem-calculate-expression --alignments -q -p ${threads} --no-bam-output -fragment-length-mean ${reads_mean_length} -fragment-length-sd 0 ${input} ${annotationIndex} ${output}
-        else
-            rsem-calculate-expression --alignments -q -p ${threads} --no-bam-output --estimate-rspd --paired-end ${input} ${annotationIndex} ${output}
-        fi
-        AfterCheck ${output}.genes.results
+        sambamba markdup -t $threads -r ${input} ${output}.rmdup.bam
+
+        samtools view -h -f 2 -q ${qualityBase} -@ ${threads} ${output}.rmdup.bam \
+        | samtools sort -O bam -@ ${threads} -o ${output}.bam
+
+        sambamba index ${output}.bam
+        AfterCheck ${output}.bam
     fi
-    total_expressed_genes=$(awk '{if($5>0){expressed++}} END {printf "%s (%.2f%%)\n", expressed, (expressed/NR)*100}' ${output}.genes.results)
-    total_expressed_isoforms=$(awk '{if($5>0){expressed++}} END {printf "%s (%.2f%%)\n", expressed, (expressed/NR)*100}' ${output}.isoforms.results)
 }
 
-# Convert bam to bigwig
+# Call peaks
+function CallPeaks(){
+    local input=$1
+    local output=$2
+    local genome=$3
+    local mode=$4
+    local effective_genome_size=$(head -1 $(dirname $(realpath ${genome}))/BWAIndex/BWAIndex.ann | cut -d " " -f1)
+    if [[ $? -eq 0 ]]; then
+        if [[ ${mode} == "SE" ]]; then
+            macs3 callpeak -f BAMSE \
+            -t ${input} \
+            -g ${effective_genome_size} \
+            -n ${output} \
+            --nomodel --shift -100 --extsize 200 \
+            -q 0.01 --outdir ./
+        else
+            macs3 callpeak -f BAMPE \
+            -t ${input} \
+            -g ${effective_genome_size} \
+            -n ${output} \
+            --nomodel --shift -100 --extsize 200 \
+            -q 0.01 --outdir ./
+        fi
+    fi
+}
+
+# Bam to bigwig
 function BamToBw(){
     local input=$1
     local output=$2
     local binSize=$3
     BeforeCheck ${output}.bw
     if [[ $? -eq 0 ]]; then
-        sambamba index -t $threads ${input}
-        bamCoverage --bam ${input} -o ${output}.bw --binSize ${binSize} -p ${threads} --normalizeUsing CPM
+        bamCoverage -b ${input} -o ${output}.bw --binSize ${binSize} --normalizeUsing RPKM
         AfterCheck ${output}.bw
     fi
 }
@@ -558,16 +478,12 @@ function Statics(){
     echo -e "Clean Reads duplication rate: ${reads_duplication_rate}%"
     echo -e "Total raw reads: ${total_reads_raw}"
     echo -e "Total clean reads: ${total_reads_clean}"
-    echo -e "Total unique mapped reads: ${total_reads_unique_mapped}"
-    echo -e "Total multiple mapped reads: ${total_reads_multiple_mapped}"
-    echo -e "Total expressed genes: ${total_expressed_genes}"
-    echo -e "Total expressed isoforms: ${total_expressed_isoforms}"
-    if [[ $(echo ${unique_mapped_rate} | awk '{print int($NF)}') -ge 90 ]]; then
-        echo -e "Unique mapping rate: \033[1;32m${unique_mapped_rate}%\033[0m"
-    elif [[ $(echo ${unique_mapped_rate} | awk '{print int($NF)}') -ge 70 ]]; then
-        echo -e "Unique mapping rate: \033[1;33m${unique_mapped_rate}%\033[0m"
+    if [[ $(echo ${alignment_rate} | awk '{print int($NF)}') -ge 90 ]]; then
+        echo -e "mapping rate: \033[1;32m${alignment_rate}%\033[0m"
+    elif [[ $(echo ${alignment_rate} | awk '{print int($NF)}') -ge 70 ]]; then
+        echo -e "mapping rate: \033[1;33m${alignment_rate}%\033[0m"
     else
-        echo -e "Unique mapping rate: \033[1;31m${unique_mapped_rate}%\033[0m"
+        echo -e "mapping rate: \033[1;31m${alignment_rate}%\033[0m"
     fi
 }
 
@@ -575,16 +491,16 @@ function Statics(){
 # ==================process=========================
 # ==================================================
 # use sra mode only when the suffix of the file name is sra or SRA, or without suffix
-tempName=$(basename $input)
+tempName=$(basename "$input" | sed 's/[@:._-].*//')
 
-if [[ -f ${output}/${tempName%%.*}.$(basename $0).report.txt ]]; then
-    echo -e "\033[1;34mNote:\033[0m ${output}/${tempName%%.*}.$(basename $0).report.txt is exist, means all steps have been done. If you want to analysis $input again, please remove the file (rm ${output}/${tempName%%.*}.$(basename $0).report.txt) and run the script again" >&2
-    exit 0
-fi
+# if [[ -f ${output}/${tempName%%.*}.$(basename $0).report.txt ]]; then
+#     echo -e "\033[1;34mNote:\033[0m ${output}/${tempName%%.*}.$(basename $0).report.txt is exist, means all steps have been done. If you want to analysis $input again, please remove the file (rm ${output}/${tempName%%.*}.$(basename $0).report.txt) and run the script again" >&2
+#     exit 0
+# fi
 
 # if input only one file, then use fellow mode
 if [ -z "$input2" ]; then
-    if [[ $input == *.sra ]] || [[ $input == *.SRA ]] || [[ ${tempName} == ${tempName%%.*} ]] ; then # due to "%%.*" will delete all content before the last ".", so we need to get the file name first, or the pathway like "../test" will be treated as "."
+    if [[ $input == *.sra ]] || [[ $input == *.SRA ]] || [[ ${tempName} == ${input%%.*} ]] ; then # due to "%%.*" will delete all content before the last ".", so we need to get the file name first, or the pathway like "../test" will be treated as "."
         if [[ ${tempName} == ${tempName%%.*} ]]; then
             echo -e "\033[1;33mWarning\033[0m: your file ($input) without suffix (such as ".sra"). SRA mode will be used by default."
         fi
@@ -594,76 +510,79 @@ if [ -z "$input2" ]; then
 
         # -------------------------- Split SRA file --------------------------
         StepCounter "Split SRA to fastq"
-        FasterqDump ${input} ${output}
+        FasterqDump ${input}
 
-        if [[ -f "${output}/${tempName%%.*}_2.fastq" && ! -f "${output}/${tempName%%.*}_3.fastq" ]];then # check whether the SRA file is paired-end or single-end
+        if [[ -f "./${tempName%%.*}_2.fastq" && ! -f "./${tempName%%.*}_3.fastq" ]];then # check whether the SRA file is paired-end or single-end
         # ========================== paired-end data ===============================
             # -------------------------- quality control for PE data -------------
             StepCounter "Quality control for PE data"
-            Fastp "PE" ${output}/${tempName%%.*} \
-                  ${output}/${tempName%%.*}_1.fastq ${output}/${tempName%%.*}_1.clean.fastq \
-                  ${output}/${tempName%%.*}_2.fastq ${output}/${tempName%%.*}_2.clean.fastq 
+            Fastp "PE" ./${tempName%%.*} \
+                  ./${tempName%%.*}_1.fastq ./${tempName%%.*}_1.clean.fastq \
+                  ./${tempName%%.*}_2.fastq ./${tempName%%.*}_2.clean.fastq 
             
-            # -------------------------- build RSEM index ------------------------
-            StepCounter "Build RSEM index"
-            RSEMIndex ${annotation} ${genome}
-
-            # -------------------------- build alignment index -------------------
-            StepCounter "Build alignment index"
-            STARIndex ${genome} ${annotation}
+            # -------------------------- build BWA index ------------------------
+            StepCounter "Build BWA index"
+            BWAIndex ${genome}
 
             # -------------------------- alignment -------------------------------
             StepCounter "Alignment"
-            STARAlignment "PE" ${output}/${tempName%%.*} $(dirname $(realpath ${genome}))/STARIndex ${output}/${tempName%%.*}_1.clean.fastq ${output}/${tempName%%.*}_2.clean.fastq
+            BWAAlignment "PE" ${tempName%%.*} $(dirname $(realpath ${genome}))/BWAIndex/BWAIndex ./${tempName%%.*}_1.clean.fastq ./${tempName%%.*}_2.clean.fastq
             
-            # -------------------------- quantification -------------
-            StepCounter "Quantification"
-            RSEMQuantification "PE" ${output}/${tempName%%.*}.Aligned.toTranscriptome.out.bam $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/${tempName%%.*}
+            # -------------------------- Remove duplicates ------------------------
+            StepCounter "Remove duplicates"
+            RemoveDuplicates ./${tempName%%.*}.raw.bam ${tempName%%.*}
+
+            # -------------------------- Call peaks ------------------------
+            StepCounter "Call peaks"
+            CallPeaks ./${tempName%%.*}.bam ${tempName%%.*} ${genome} "PE"
 
             # ------------------------- convert bam to bigwig -------------
             if [[ ${binSize} -gt 0 ]]; then
                 StepCounter "Convert bam to bigwig"
-                BamToBw ${output}/${tempName%%.*}.Aligned.sortedByCoord.out.bam ${output}/${tempName%%.*} ${binSize}
+                BamToBw ${tempName%%.*}.bam ${tempName%%.*} ${binSize}
             fi
 
             # ------------------------- remove the intermediate files -----------
             if [[ ${remove} == "1" ]];then
                 StepCounter "Remove the intermediate files"
-                RemoveIntermediateFiles ${output}/${tempName%%.*}
+                RemoveIntermediateFiles ./${tempName%%.*}
             fi
-        elif [[ -f "${output}/${tempName%%.*}.fastq" || ( -f "${output}/${tempName%%.*}_1.fastq" && ! -f "${output}/${tempName%%.*}_2.fastq" ) ]];then
+        elif [[ -f "./${tempName%%.*}.fastq" || ( -f "./${tempName%%.*}_1.fastq" && ! -f "./${tempName%%.*}_2.fastq" ) ]];then
         # ========================== single-end data ===============================
             # -------------------------- quality control for SE data -------------
             StepCounter "Quality control for SE data"
-            Fastp "SE" ${output}/${tempName%%.*} \
-                  ${output}/${tempName%%.*}.fastq ${output}/${tempName%%.*}.clean.fastq
+            if [[ -f "./${tempName%%.*}.fastq" ]]; then
+                Fastp "SE" ./${tempName%%.*} ./${tempName%%.*}.fastq ./${tempName%%.*}.clean.fastq
+            else
+                Fastp "SE" ./${tempName%%.*} ./${tempName%%.*}_1.fastq ./${tempName%%.*}.clean.fastq
+            fi
 
-            # -------------------------- build RSEM index ------------------------
-            StepCounter "Build RSEM index"
-            RSEMIndex ${annotation} ${genome}
-
-            # -------------------------- build alignment index -------------------
-            StepCounter "Build alignment index"
-            STARIndex ${genome} ${annotation}
+            # -------------------------- build BWA index ------------------------
+            StepCounter "Build BWA index"
+            BWAIndex ${genome}
 
             # -------------------------- alignment -------------------------------
             StepCounter "Alignment"
-            STARAlignment "SE" ${output}/${tempName%%.*} $(dirname $(realpath ${genome}))/STARIndex ${output}/${tempName%%.*}.clean.fastq
+            BWAAlignment "SE" ${tempName%%.*} $(dirname $(realpath ${genome}))/BWAIndex/BWAIndex ./${tempName%%.*}.clean.fastq
 
-            # -------------------------- quantification -------------
-            StepCounter "Quantification"
-            RSEMQuantification "SE" ${output}/${tempName%%.*}.Aligned.toTranscriptome.out.bam $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/${tempName%%.*}
+            # -------------------------- Remove duplicates ------------------------
+            StepCounter "Remove duplicates"
+            RemoveDuplicates ./${tempName%%.*}.raw.bam ${tempName%%.*}
+
+            # -------------------------- Call peaks ------------------------
+            StepCounter "Call peaks"
+            CallPeaks ./${tempName%%.*}.bam ${tempName%%.*} ${genome} "SE"
 
             # ------------------------- convert bam to bigwig -------------
             if [[ ${binSize} -gt 0 ]]; then
                 StepCounter "Convert bam to bigwig"
-                BamToBw ${output}/${tempName%%.*}.Aligned.sortedByCoord.out.bam ${output}/${tempName%%.*} ${binSize}
+                BamToBw ${tempName%%.*}.bam ${tempName%%.*} ${binSize}
             fi
 
             # ------------------------- remove the intermediate files -----------
             if [[ ${remove} == "1" ]];then
                 StepCounter "Remove the intermediate files"
-                RemoveIntermediateFiles ${output}/${tempName%%.*}
+                RemoveIntermediateFiles ./${tempName%%.*}
             fi
         else
             echo -e "\033[1;31mError\033[0m: your file ($input) is not paired-end or single-end, maybe it is single cell data"
@@ -675,7 +594,7 @@ if [ -z "$input2" ]; then
         # ====================================================================================================
         StepCounter "Finnal statics"
         Statics
-        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ${output}/${tempName%%.*}.$(basename $0).report.txt
+        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ./${tempName%%.*}.$(basename $0).report.txt
         exit 0
     fi
     # if the suffix of the file name is fastq or fastq.gz or fq.gz or fq, then use fastq mode
@@ -686,74 +605,72 @@ if [ -z "$input2" ]; then
         # ====================================================================================================
         # -------------------------- quality control for SE data -------------
         StepCounter "Quality control for SE data"
-        Fastp "SE" ${output}/${tempName%%.*} ${input} ${output}/${tempName%%.*}.clean.fastq
+        Fastp "SE" ${tempName%%.*} ${input} ./${tempName%%.*}.clean.fastq
 
-        # -------------------------- build RSEM index ------------------------
-        StepCounter "Build RSEM index"
-        RSEMIndex ${annotation} ${genome}
-
-        # -------------------------- build alignment index -------------------
-        StepCounter "Build alignment index"
-        STARIndex ${genome} ${annotation}
+        # -------------------------- build BWA index ------------------------
+        StepCounter "Build BWA index"
+        BWAIndex ${genome}
 
         # -------------------------- alignment -------------------------------
         StepCounter "Alignment"
-        STARAlignment "SE" ${output}/${tempName%%.*} $(dirname $(realpath ${genome}))/STARIndex ${output}/${tempName%%.*}.clean.fastq
+        BWAAlignment "SE" ${tempName%%.*} $(dirname $(realpath ${genome}))/BWAIndex/BWAIndex ./${tempName%%.*}.clean.fastq
 
-        # -------------------------- quantification -------------
-        StepCounter "Quantification"
-        RSEMQuantification "SE" ${output}/${tempName%%.*}.Aligned.toTranscriptome.out.bam $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/${tempName%%.*}
+        # -------------------------- Remove duplicates ------------------------
+        StepCounter "Remove duplicates"
+        RemoveDuplicates ./${tempName%%.*}.raw.bam ${tempName%%.*}
+
+        # -------------------------- Call peaks ------------------------
+        StepCounter "Call peaks"
+        CallPeaks ./${tempName%%.*}.bam ${tempName%%.*} ${genome} "SE"
 
         # ------------------------- convert bam to bigwig -------------
         if [[ ${binSize} -gt 0 ]]; then
             StepCounter "Convert bam to bigwig"
-            BamToBw ${output}/${tempName%%.*}.Aligned.sortedByCoord.out.bam ${output}/${tempName%%.*} ${binSize}
+            BamToBw ${tempName%%.*}.bam ${tempName%%.*} ${binSize}
         fi
 
         # ------------------------- remove the intermediate files -----------
         if [[ ${remove} == "1" ]];then
             StepCounter "Remove the intermediate files"
-            RemoveIntermediateFiles ${output}/${tempName%%.*}
+            RemoveIntermediateFiles ./${tempName%%.*}
         fi
+
         # ====================================================================================================
         # ======================================== End of fastq SE mode ======================================
         # ====================================================================================================
         StepCounter "Finnal statics"
         Statics
-        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ${output}/${tempName%%.*}.$(basename $0).report.txt
+        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ./${tempName%%.*}.$(basename $0).report.txt
         exit 0
     fi
     if [[ $input == *.bam ]]; then
         # ====================================================================================================
         # ======================================== Start of bam mode =========================================
         # ====================================================================================================
-        # -------------------------- build RSEM index ------------------------
-        StepCounter "Build RSEM index"
-        RSEMIndex ${annotation} ${genome}
 
-        # -------------------------- build alignment index -------------------
-        StepCounter "Build alignment index"
-        STARIndex ${genome} ${annotation}
+        #  ------------------------- Remove duplicates ------------------------
+        StepCounter "Remove duplicates"
+        RemoveDuplicates ${input} ${tempName%%.*}
 
-        # -------------------------- quantification -------------
-        StepCounter "Quantification"
+        # -------------------------- Call peaks ------------------------
+        StepCounter "Call peaks"
         odd_count=$(sambamba view ${input} | head -10000 | cut -f 2 | sort | uniq | awk '$1 % 2 == 0'|wc -l)
         if [[ ${odd_count} -gt 0 ]]; then
-            RSEMQuantification "SE" ${input} $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/${tempName%%.*}
+            CallPeaks ${tempName%%.*}.bam ${tempName%%.*} ${genome} "SE"
         else
-            RSEMQuantification "PE" ${input} $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/${tempName%%.*}
+            CallPeaks ${tempName%%.*}.bam ${tempName%%.*} ${genome} "PE"
         fi
-    
+
         # ------------------------- convert bam to bigwig -------------
-        # if [[ ${binSize} -gt 0 ]]; then
-        #     StepCounter "Convert bam to bigwig"
-        #     BamToBw ${input} ${output}/${tempName%%.*} ${binSize}
-        # fi
+        if [[ ${binSize} -gt 0 ]]; then
+            StepCounter "Convert bam to bigwig"
+            BamToBw ${tempName%%.*}.bam ${tempName%%.*} ${binSize}
+        fi
 
         # ------------------------- remove the intermediate files -----------
         if [[ ${remove} == "1" ]];then
             StepCounter "Remove the intermediate files"
-            RemoveIntermediateFiles ${output}/${tempName%%.*}
+            RemoveIntermediateFiles ./${tempName%%.*}
         fi
 
         # ====================================================================================================
@@ -761,59 +678,15 @@ if [ -z "$input2" ]; then
         # ====================================================================================================
         StepCounter "Finnal statics"
         Statics
-        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ${output}/${tempName%%.*}.$(basename $0).report.txt
+        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ./${tempName%%.*}.$(basename $0).report.txt
         exit 0
     fi
-    if [[ $input == *.sam ]]; then
-        # ====================================================================================================
-        # ======================================== Start of sam mode =========================================
-        # ====================================================================================================
-        # -------------------------- build RSEM index ------------------------
-        StepCounter "Build RSEM index"
-        RSEMIndex ${annotation} ${genome}
 
-        # -------------------------- build alignment index -------------------
-        StepCounter "Build alignment index"
-        STARIndex ${genome} ${annotation}
-
-        # -------------------------- convert sam to bam -----------------------
-        StepCounter "Convert sam to bam"
-        sambamba view -h -f bam -t ${threads} -S ${input} -o ${output}/$(basename ${input} .sam).bam
-
-        # -------------------------- quantification -------------
-        StepCounter "Quantification"
-        odd_count=$(sambamba view ${output}/$(basename ${input} .sam).bam | head -10000 | cut -f 2 | sort | uniq | awk '$1 % 2 == 0'|wc -l)
-        if [[ ${odd_count} -gt 0 ]]; then
-            RSEMQuantification "SE" ${output}/$(basename ${input} .sam).bam $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/$(basename ${input} .sam)
-        else
-            RSEMQuantification "PE" ${output}/$(basename ${input} .sam).bam $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/$(basename ${input} .sam)
-        fi
-
-        # ------------------------- convert bam to bigwig -------------
-        # if [[ ${binSize} -gt 0 ]]; then
-        #     StepCounter "Convert bam to bigwig"
-        #     BamToBw ${output}/$(basename ${input} .sam).bam ${output}/$(basename ${input%%.*}) ${binSize}
-        # fi
-
-        # ------------------------- remove the intermediate files -----------
-        if [[ ${remove} == "1" ]];then
-            StepCounter "Remove the intermediate files"
-            RemoveIntermediateFiles ${output}/$(basename ${input%%.*})
-        fi
-
-        # ====================================================================================================
-        # ======================================== End of sam mode ===========================================
-        # ====================================================================================================
-        StepCounter "Finnal statics"
-        Statics
-        Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ${output}/${tempName%%.*}.$(basename $0).report.txt
-        exit 0
-    fi
     # if the suffix of the file name is not sra or fastq or fastq.gz or fq.gz or fq or bam or sam, then print \033[1;31mError\033[0m information
     if [[ ${tempName} != ${tempName%%.*} ]] && [[ $input != *.sra ]] && [[ $input != *.SRA ]] && [[ $input != *.fastq ]] && [[ $input != *.fastq.gz ]] && [[ $input != *.fq.gz ]] && [[ $input != *.fq ]] && [[ $input != *.bam ]] && [[ $input != *.sam ]]; then
         echo -e "\033[1;31mError\033[0m: we can't recognize your input file."
         echo -e "\033[1;32mHow to solve?\033[0m Please check your input file type."
-        echo -e "\033[1;34mNote:\033[0m only SRA(.sra), Fastq(.fq/.fq.gz), BAM(.bam) or SAM(.sam) are supported as input."
+        echo -e "\033[1;34mNote:\033[0m only SRA(.sra), Fastq(.fq/.fq.gz) or BAM(.bam) are supported as input."
         exit 1
     fi
 # if input two files, then use paired end mode and if the suffix must be fastq or fastq.gz or fq.gz or fq
@@ -828,41 +701,41 @@ else
             # ====================================================================================================
             # -------------------------- quality control for PE data -------------
             StepCounter "Quality control for PE data"
-            Fastp "PE" ${output}/${tempName%%.*} ${input} ${output}/${tempName%%.*}_1.clean.fastq ${input2} ${output}/${tempName%%.*}_2.clean.fastq
+            Fastp "PE" ${tempName%%.*} ${input} ./${tempName%%.*}_1.clean.fastq ${input2} ./${tempName%%.*}_2.clean.fastq
 
-            # -------------------------- build RSEM index ------------------------
-            StepCounter "Build RSEM index"
-            RSEMIndex ${annotation} ${genome}
-
-            # -------------------------- build alignment index -------------------
-            StepCounter "Build alignment index"
-            STARIndex ${genome} ${annotation}
+            # -------------------------- build BWA index ------------------------
+            StepCounter "Build BWA index"
+            BWAIndex ${genome}
 
             # -------------------------- alignment -------------------------------
             StepCounter "Alignment"
-            STARAlignment "PE" ${output}/${tempName%%.*} $(dirname $(realpath ${genome}))/STARIndex ${output}/${tempName%%.*}_1.clean.fastq ${output}/${tempName%%.*}_2.clean.fastq
+            BWAAlignment "PE" ${tempName%%.*} $(dirname $(realpath ${genome}))/BWAIndex/BWAIndex ./${tempName%%.*}_1.clean.fastq ./${tempName%%.*}_2.clean.fastq
 
-            # -------------------------- quantification -------------
-            StepCounter "Quantification"
-            RSEMQuantification "PE" ${output}/${tempName%%.*}.Aligned.toTranscriptome.out.bam $(dirname $(realpath ${annotation}))/RSEMIndex/RSEMIndex ${output}/${tempName%%.*}
+            # -------------------------- Remove duplicates ------------------------
+            StepCounter "Remove duplicates"
+            RemoveDuplicates ${tempName%%.*}.raw.bam ${tempName%%.*}
+
+            # -------------------------- Call peaks ------------------------
+            StepCounter "Call peaks"
+            CallPeaks ${tempName%%.*}.bam ${tempName%%.*} ${genome} "PE"
 
             # ------------------------- convert bam to bigwig -------------
             if [[ ${binSize} -gt 0 ]]; then
                 StepCounter "Convert bam to bigwig"
-                BamToBw ${output}/${tempName%%.*}.Aligned.sortedByCoord.out.bam ${output}/${tempName%%.*} ${binSize}
+                BamToBw ${tempName%%.*}.bam ${tempName%%.*} ${binSize}
             fi
 
             # ------------------------- remove the intermediate files -----------
             if [[ ${remove} == "1" ]];then
                 StepCounter "Remove the intermediate files"
-                RemoveIntermediateFiles ${output}/${tempName%%.*}
+                RemoveIntermediateFiles ./${tempName%%.*}
             fi
             # ====================================================================================================
             # ======================================== End of PE mode ============================================
             # ====================================================================================================
             StepCounter "Finnal statics"
             Statics
-            Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ${output}/${tempName%%.*}.$(basename $0).report.txt
+            Statics | sed "s/\x1B\[[0-9;]*[JKmsu]//g" > ./${tempName%%.*}.$(basename $0).report.txt
             exit 0
         fi 
     else
