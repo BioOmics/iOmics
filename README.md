@@ -346,6 +346,199 @@ If you use this pipeline in your research, please cite:
 - Zhejiang University for support
 
 ---
+# Bulk RNA-Seq Quantification Pipeline
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bash](https://img.shields.io/badge/language-bash-blue.svg)](https://www.gnu.org/software/bash/)
+[![Bioinformatics](https://img.shields.io/badge/bioinformatics-RNA--seq-red.svg)](https://en.wikipedia.org/wiki/RNA-Seq)
+
+A comprehensive Bash pipeline for processing bulk RNA-Seq data, from raw reads to gene expression quantification and visualization.
+
+## 📝 Description
+
+This pipeline automates the processing of bulk RNA-Seq data, handling various input formats and performing quality control, splice-aware alignment, transcript quantification, and bigwig file generation. It uses STAR for fast and accurate alignment and RSEM for precise transcript/gene-level quantification.
+
+## ✨ Features
+
+- **Multiple input formats**: Supports SRA, FASTQ (single/paired-end), BAM, and SAM files
+- **Splice-aware alignment**: STAR for accurate mapping across splice junctions
+- **Transcript quantification**: RSEM for gene and isoform-level expression estimates
+- **Comprehensive quality control**: Fastp for read trimming and quality filtering
+- **Duplicate awareness**: Sambamba for marking duplicates (optional)
+- **Visualization**: BigWig file generation with deepTools
+- **Resume capability**: Skip completed steps with `-s` option
+- **Clean output**: Optional removal of intermediate files
+
+## 🔧 Dependencies
+
+| Software | Purpose | Installation |
+|----------|---------|--------------|
+| sra-tools | SRA file conversion | `conda install -c bioconda sra-tools` |
+| fastp | Quality control | `conda install -c bioconda fastp` |
+| STAR | Splice-aware alignment | `conda install -c bioconda star` |
+| rsem | Gene/transcript quantification | `conda install -c bioconda rsem` |
+| sambamba | BAM processing | `conda install -c bioconda sambamba` |
+| deeptools | BigWig generation | `conda install -c bioconda deeptools` |
+
+## 🚀 Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/Haoyu-Chao/rnaseq-pipeline.git
+cd rnaseq-pipeline
+
+# Make the script executable
+chmod +x rnaseq-pipeline.sh
+
+# Run the pipeline (single-end FASTQ example)
+./rnaseq-pipeline.sh -i sample.fq.gz -g genome.fa -a annotation.gtf -t 8
+```
+
+## 📋 Usage
+
+```bash
+./rnaseq-pipeline.sh -i INPUT -g GENOME -a ANNOTATION [OPTIONS]
+```
+
+### Required Parameters
+
+| Option | Description |
+|--------|-------------|
+| `-i, --input` | Input file (SRA, FASTQ, BAM, or SAM) |
+| `-I, --input2` | Second input file for paired-end FASTQ |
+| `-g, --genome` | Reference genome FASTA file |
+| `-a, --annotation` | Annotation file (GTF or GFF3 format) |
+
+### Optional Parameters
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-q, --qualityBase` | Minimum base quality score | 20 |
+| `-b, --binSize` | Generate bigwig with specified bin size | No bigwig |
+| `-o, --output` | Output directory | `./[input]_pipeline_result` |
+| `-t, --threads` | Number of CPU threads | 8 |
+| `-f, --force` | Force overwrite output directory | No |
+| `-s, --skip` | Skip completed steps | No |
+| `-r, --remove` | Remove intermediate files | No |
+| `-h, --help` | Show help message | - |
+| `-v, --version` | Show version | - |
+
+## 📦 Output Structure
+
+```
+[input]_pipeline_result/
+├── fastp/               # Fastp quality control reports (HTML/JSON)
+├── bam/                 # Sorted BAM files with indexes
+├── quantification/      
+│   ├── rsem/            # RSEM output files (genes/isoforms results)
+│   └── counts/          # Raw count matrices
+├── bigwig/              # BigWig files for visualization (if -b used)
+└── logs/                # Pipeline execution logs
+```
+
+### Quantification Output Files
+
+RSEM generates multiple output files:
+- `.genes.results`: Gene-level expression estimates (TPM/expected counts)
+- `.isoforms.results`: Transcript-level expression estimates
+- `.transcript.bam`: Transcriptome-aligned BAM file
+- `.stat`: Alignment statistics
+
+## 💡 Examples
+
+### 1. Process SRA file
+```bash
+./rnaseq-pipeline.sh -i SRR12345678.sra -g hg38.fa -a hg38.gtf
+```
+
+### 2. Paired-end FASTQ files
+```bash
+./rnaseq-pipeline.sh -i sample_R1.fq.gz -I sample_R2.fq.gz -g mm10.fa -a mm10.gtf -t 16
+```
+
+### 3. Generate bigwig file for visualization
+```bash
+./rnaseq-pipeline.sh -i sample.bam -g genome.fa -a genes.gtf -b 10 -o ./rnaseq_results
+```
+
+### 4. Resume interrupted run with cleanup
+```bash
+./rnaseq-pipeline.sh -i sample.fq.gz -g genome.fa -a genes.gtf -s -r
+```
+
+## 📊 Pipeline Steps
+
+1. **Input conversion** (if SRA): `fasterq-dump` → FASTQ
+2. **Quality control**: `fastp` → Clean FASTQ + HTML report
+3. **Genome index preparation** (if needed): `STAR --runMode genomeGenerate`
+4. **Alignment**: `STAR --runMode alignReads` → SAM
+5. **BAM processing**: `samtools view → sambamba sort → sambamba markdup`
+6. **RSEM preparation**: `rsem-prepare-reference` (if needed)
+7. **Quantification**: `rsem-calculate-expression` → Gene/transcript counts
+8. **BigWig generation** (optional): `bamCoverage` → Normalized coverage tracks
+
+## ⚙️ Important Notes for RNA-Seq
+
+- **Genome indexing**: Both STAR and RSEM require indexed genomes. The pipeline will check and generate them if missing:
+  ```bash
+  # STAR index (required in genome directory)
+  STAR --runMode genomeGenerate --genomeDir ./star_index --genomeFastaFiles genome.fa --sjdbGTFfile annotation.gtf
+  
+  # RSEM index (required in genome directory)  
+  rsem-prepare-reference --gtf annotation.gtf genome.fa ./rsem_index/reference
+  ```
+
+- **Memory requirements**: STAR alignment can be memory-intensive. For large genomes (e.g., human), ensure sufficient RAM (≥30GB recommended)
+
+- **Stranded libraries**: RSEM automatically detects library strandedness; specify with `--strandedness` if needed
+
+## 📈 Output Metrics
+
+The pipeline generates several quality metrics:
+- **Fastp reports**: Base quality, GC content, adapter contamination
+- **STAR logs**: Mapping rates, unique/multi-mapping reads, splice junctions
+- **RSEM statistics**: Alignment rates, gene detection rates
+- **BigWig files**: Genome coverage tracks for visualization (IGV, UCSC)
+
+## 📝 Notes
+
+- The genome FASTA and annotation GTF files must be **compatible** (same chromosome names, coordinates)
+- For paired-end data, both files must be provided with `-i` and `-I`
+- STAR and RSEM indices should be generated once per genome/annotation combination
+- Consider using `-r` flag to remove intermediate files (SAM, unsorted BAM) to save disk space
+
+## 🤝 Contributing
+
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/Haoyu-Chao/rnaseq-pipeline/issues).
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 👨‍💻 Author
+
+**Haoyu Chao** (haoyuchao@zju.edu.cn)
+
+## 📚 Citation
+
+If you use this pipeline in your research, please cite:
+
+```
+@software{rnaseq_pipeline,
+  author = {Chao, Haoyu},
+  title = {Bulk RNA-Seq Quantification Pipeline},
+  year = {2024},
+  url = {https://github.com/Haoyu-Chao/rnaseq-pipeline}
+}
+```
+
+## 🙏 Acknowledgments
+
+- The developers of STAR, RSEM, and all dependency tools
+- Zhejiang University for support
+
+---
+
 
 
 **Last updated**: 2024-11-01
