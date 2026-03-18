@@ -538,7 +538,216 @@ If you use this pipeline in your research, please cite:
 - Zhejiang University for support
 
 ---
+# Bulk BS-Seq (WGBS) Analysis Pipeline
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Bash](https://img.shields.io/badge/language-bash-blue.svg)](https://www.gnu.org/software/bash/)
+[![Bioinformatics](https://img.shields.io/badge/bioinformatics-BS--Seq-purple.svg)](https://en.wikipedia.org/wiki/Bisulfite_sequencing)
+
+A comprehensive Bash pipeline for processing whole-genome bisulfite sequencing (WGBS/BS-Seq) data, from raw reads to methylation calls.
+
+## 📝 Description
+
+This pipeline automates the processing of bisulfite sequencing data, handling various input formats and performing quality control, bisulfite-aware alignment, methylation extraction, and annotation. It uses bwameth for accurate alignment of bisulfite-converted reads and MethylDackel for precise methylation calling.
+
+## ✨ Features
+
+- **Multiple input formats**: Supports SRA, FASTQ (single/paired-end), BAM, and SAM files
+- **Bisulfite-aware alignment**: bwameth for accurate mapping of C→T converted reads
+- **Methylation extraction**: MethylDackel for per-base methylation levels
+- **Quality control**: Fastp for read trimming and quality filtering
+- **Duplicate marking**: Sambamba for identifying PCR duplicates
+- **Region-specific analysis**: Extract methylation levels for specific genomic regions
+- **Resume capability**: Skip completed steps with checkpoint system
+- **Clean output**: Optional removal of intermediate files
+
+## 🔧 Dependencies
+
+| Software | Purpose | Installation |
+|----------|---------|--------------|
+| sra-tools | SRA file conversion | `conda install -c bioconda sra-tools` |
+| fastp | Quality control | `conda install -c bioconda fastp` |
+| bwameth | Bisulfite-aware alignment | `conda install -c bioconda bwameth` |
+| sambamba | BAM processing | `conda install -c bioconda sambamba` |
+| samtools | SAM/BAM manipulation | `conda install -c bioconda samtools` |
+| MethylDackel | Methylation extraction | `conda install -c bioconda methyldackel` |
+| bedtools | Intersection operations | `conda install -c bioconda bedtools` |
+
+## 🚀 Quick Start
+
+```bash
+# Clone the repository
+git clone https://github.com/Haoyu-Chao/bsseq-pipeline.git
+cd bsseq-pipeline
+
+# Make the script executable
+chmod +x bsseq-pipeline.sh
+
+# Run the pipeline (single-end FASTQ example)
+./bsseq-pipeline.sh -i sample.fq.gz -g genome.fa -a annotation.gff3 -t 8
+```
+
+## 📋 Usage
+
+```bash
+./bsseq-pipeline.sh -i INPUT -g GENOME -a ANNOTATION [OPTIONS]
+```
+
+### Required Parameters
+
+| Option | Description |
+|--------|-------------|
+| `-i, --input` | Input file (SRA, FASTQ, BAM, or SAM) |
+| `-I, --input2` | Second input file for paired-end FASTQ |
+| `-g, --genome` | Reference genome FASTA file |
+| `-a, --annotation` | Annotation file (GFF3 or GTF format) |
+
+### Optional Parameters
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `-q, --mapq` | Minimum mapping quality for BAM filtering | 10 |
+| `-o, --output` | Output directory | `./[input]_pipeline_result` |
+| `-t, --threads` | Number of CPU threads | 8 |
+| `-f, --force` | Force overwrite output directory | No |
+| `-r, --remove` | Remove intermediate files | No |
+| `-h, --help` | Show help message | - |
+| `-v, --version` | Show version | - |
+
+## 📦 Output Structure
+
+```
+[input]_pipeline_result/
+├── fastq/               # Clean FASTQ files after QC
+├── bam/                 
+│   ├── alignment/       # Raw aligned BAM files
+│   ├── sorted/          # Sorted BAM files
+│   ├── dedup/           # Deduplicated BAM files
+│   └── filtered/        # Filtered BAM files (by MAPQ)
+├── methylation/
+│   ├── perBase/         # Per-base methylation calls (BEDGraph)
+│   ├── perRegion/       # Regional methylation levels
+│   └── CGmap/           # CGmap format files
+├── reports/             # QC reports and statistics
+└── logs/                # Pipeline execution logs
+```
+
+### Methylation Output Files
+
+MethylDackel generates several output formats:
+- **BEDGraph**: Per-base methylation levels (`chr start end methylation_level depth`)
+- **CGmap**: Complete Genomics methylation format
+- **perRegion**: Aggregated methylation over genomic features (promoters, genes, CpG islands)
+
+## 💡 Examples
+
+### 1. Process SRA file
+```bash
+./bsseq-pipeline.sh -i SRR12345678.sra -g hg38.fa -a hg38.gff3
+```
+
+### 2. Paired-end FASTQ files
+```bash
+./bsseq-pipeline.sh -i sample_R1.fq.gz -I sample_R2.fq.gz -g mm10.fa -a mm10.gtf -t 16
+```
+
+### 3. High-stringency mapping
+```bash
+./bsseq-pipeline.sh -i sample.fq.gz -g genome.fa -a genes.gff3 -q 20 -t 8
+```
+
+### 4. Clean up intermediate files
+```bash
+./bsseq-pipeline.sh -i sample.bam -g genome.fa -a annotation.gff3 -r
+```
+
+## 📊 Pipeline Steps
+
+1. **Input conversion** (if SRA): `fasterq-dump` → FASTQ
+2. **Quality control**: `fastp` → Clean FASTQ + HTML report
+3. **Bisulfite alignment**: `bwameth.py` → SAM
+4. **BAM processing**: 
+   - `samtools view` → BAM
+   - `sambamba sort` → Sorted BAM
+   - `sambamba markdup` → Deduplicated BAM
+   - `samtools view -q` → Filtered BAM
+5. **Methylation extraction**: `MethylDackel extract` → Per-base methylation
+6. **Regional methylation**: `MethylDackel mbias` + bedtools → Region-level methylation
+7. **Quality reports**: Generate alignment statistics and methylation summary
+
+## ⚙️ Important Notes for BS-Seq
+
+### Genome Preparation
+Before running the pipeline, prepare the bwameth index:
+```bash
+# Convert reference genome for bwameth
+bwameth.py index genome.fa
+```
+
+### Library Type Considerations
+The pipeline automatically detects and handles:
+- **Directional libraries**: Standard BS-Seq protocol
+- **Non-directional libraries**: Uses appropriate parameters in MethylDackel
+
+### Methylation Contexts
+Methylation calls are generated for all contexts (CpG, CHG, CHH) and can be filtered in downstream analysis.
+
+## 📈 Output Metrics
+
+The pipeline generates comprehensive quality metrics:
+- **Bisulfite conversion rate**: Estimated from non-CpG contexts or spike-ins
+- **Mapping statistics**: Overall alignment rate, unique mapping rate
+- **Coverage depth**: Per-base and regional coverage statistics
+- **Methylation bias**: Position-specific methylation bias plots
+- **CpG coverage**: Genome-wide CpG coverage distribution
+
+## 🔬 Interpretation Notes
+
+- **CpG methylation**: Most relevant for gene regulation studies
+- **CHG/CHH methylation**: Important in plants, rare in mammals
+- **Coverage thresholds**: Typically require ≥5x coverage for reliable methylation calls
+- **Strand-specificity**: MethylDackel maintains strand-specific information
+
+## 📝 Notes
+
+- bwameth requires the reference genome to be indexed with `bwameth.py index`
+- For large genomes (e.g., human), ensure sufficient disk space (≥100GB for intermediate files)
+- The pipeline maintains strand-specific methylation information throughout
+- Consider using `-r` flag for large datasets to manage disk usage
+
+## 🤝 Contributing
+
+Contributions, issues, and feature requests are welcome! Feel free to check the [issues page](https://github.com/Haoyu-Chao/bsseq-pipeline/issues).
+
+## 📄 License
+
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
+## 👨‍💻 Author
+
+**Haoyu Chao** (haoyuchao@zju.edu.cn)
+
+## 📚 Citation
+
+If you use this pipeline in your research, please cite:
+
+```
+@software{bsseq_pipeline,
+  author = {Chao, Haoyu},
+  title = {Bulk BS-Seq (WGBS) Analysis Pipeline},
+  year = {2023},
+  url = {https://github.com/Haoyu-Chao/bsseq-pipeline}
+}
+```
+
+## 🙏 Acknowledgments
+
+- The developers of bwameth, MethylDackel, and all dependency tools
+- Zhejiang University for support
+
+---
+
+**Last updated**: 2023-03-30
 
 
 **Last updated**: 2024-11-01
